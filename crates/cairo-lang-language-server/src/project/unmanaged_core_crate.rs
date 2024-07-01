@@ -1,13 +1,16 @@
+use std::path;
 use std::path::{Path, PathBuf};
 
-use cairo_lang_filesystem::db::{init_dev_corelib, FilesGroup};
-use tracing::warn;
+use anyhow::Context;
+use cairo_lang_filesystem::db::init_dev_corelib;
+use tracing::{error, warn};
 
 use crate::config::Config;
+use crate::lang::db::AnalysisDatabase;
 
 /// Try to find a Cairo `core` crate (see [`find_unmanaged_core`]) and initialize it in the
 /// provided database.
-pub fn try_to_init_unmanaged_core(config: &Config, db: &mut (dyn FilesGroup + 'static)) {
+pub fn try_to_init_unmanaged_core(config: &Config, db: &mut AnalysisDatabase) {
     if let Some(path) = find_unmanaged_core(config) {
         init_dev_corelib(db, path);
     } else {
@@ -17,14 +20,21 @@ pub fn try_to_init_unmanaged_core(config: &Config, db: &mut (dyn FilesGroup + 's
 
 /// Try to find a Cairo `core` crate in various well-known places, for use in project backends that
 /// do not manage the `core` crate (i.e., anything non-Scarb).
+///
+/// The path is guaranteed to be absolute, so it can be safely used as a `FileId` in LS Salsa DB.
 pub fn find_unmanaged_core(config: &Config) -> Option<PathBuf> {
     // TODO(mkaput): First, try to find Scarb-managed `core` package if we have Scarb toolchain.
     //   The most reliable way to do this is to create an empty Scarb package, and run
     //   `scarb metadata` on it. The `core` package will be a component of this empty package.
     //   For minimal packages, `scarb metadata` should be pretty fast.
-    // TODO(mkaput): Shouldn't `fallback` actually be an `override`?
-    cairo_lang_filesystem::detect::detect_corelib()
-        .or_else(|| find_core_at_path(config.unmanaged_core_fallback_path.as_ref()?.as_path()))
+    find_core_at_config_path(config)
+        .or_else(cairo_lang_filesystem::detect::detect_corelib)
+        .and_then(ensure_absolute)
+}
+
+/// Attempts to find the `core` crate source root at the path provided in the configuration.
+fn find_core_at_config_path(config: &Config) -> Option<PathBuf> {
+    find_core_at_path(config.unmanaged_core_path.as_ref()?.as_path())
 }
 
 /// Attempts to find the `core` crate source root at a given path.
@@ -55,4 +65,14 @@ fn find_core_at_path(root_path: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Makes a path absolute, or logs an error.
+fn ensure_absolute(path: PathBuf) -> Option<PathBuf> {
+    path::absolute(&path)
+        .with_context(|| {
+            format!("failed to make `core` crate path absolute: {path}", path = path.display())
+        })
+        .inspect_err(|e| error!("{e:?}"))
+        .ok()
 }

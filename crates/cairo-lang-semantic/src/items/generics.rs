@@ -15,7 +15,7 @@ use syntax::node::db::SyntaxGroup;
 use syntax::node::TypedStablePtr;
 
 use super::constant::{ConstValue, ConstValueId};
-use super::imp::{ImplHead, ImplId};
+use super::imp::{ImplHead, ImplId, ImplLongId};
 use super::resolve_trait_path;
 use crate::db::SemanticGroup;
 use crate::diagnostic::{
@@ -36,7 +36,7 @@ use crate::{ConcreteTraitId, SemanticDiagnostic, TypeId, TypeLongId};
 pub enum GenericArgumentId {
     Type(TypeId),
     Constant(ConstValueId),
-    Impl(ImplId), // TODO(spapini): impls and constants as generic values.
+    Impl(ImplId),
     NegImpl,
 }
 impl GenericArgumentId {
@@ -149,7 +149,7 @@ impl GenericParam {
                 GenericArgumentId::Constant(ConstValue::Generic(param_const.id).intern(db))
             }
             GenericParam::Impl(param_impl) => {
-                GenericArgumentId::Impl(ImplId::GenericParameter(param_impl.id))
+                GenericArgumentId::Impl(ImplLongId::GenericParameter(param_impl.id).intern(db))
             }
             GenericParam::NegImpl(_) => GenericArgumentId::NegImpl,
         }
@@ -291,6 +291,11 @@ pub fn priv_generic_param_data(
     let inference_id = InferenceId::GenericParam(generic_param_id);
     let mut resolver =
         Resolver::with_data(db, (*context_resolver_data).clone_with_inference_id(db, inference_id));
+    resolver.set_allowed_features(
+        &lookup_item,
+        &lookup_item.untyped_stable_ptr(db.upcast()).lookup(db.upcast()),
+        &mut diagnostics,
+    );
     let generic_params_syntax = extract_matches!(
         generic_param_generic_params_list(db, generic_param_id)?,
         ast::OptionWrappedGenericParamList::WrappedGenericParamList
