@@ -530,10 +530,8 @@ fn compute_expr_inline_macro_semantic(
                 ctx.db.macro_declaration_resolver_data(macro_declaration_id)?;
             let parent_macro_call_data = ctx.resolver.macro_call_data.clone();
             ctx.resolver.macro_call_data = Some(ResolverMacroData {
-                defsite_data: macro_defsite_resolver_data,
-                callsite_data: callsite_resolver
-                    .clone_with_inference_id(ctx.db, inference_id)
-                    .into(),
+                defsite_module_file_id: macro_defsite_resolver_data.module_file_id,
+                callsite_module_file_id: callsite_resolver.module_file_id,
                 expansion_result: expanded_code.clone().into(),
                 parent_macro_call_data: parent_macro_call_data.map(|data| data.into()),
             });
@@ -589,6 +587,7 @@ fn compute_expr_inline_macro_semantic(
         content: content.clone().into(),
         code_mappings: mappings.clone().into(),
         kind: FileKind::Expr,
+        original_item_removed: true,
     })
     .intern(ctx.db);
     let expr_syntax = ctx.db.file_expr_syntax(new_file)?;
