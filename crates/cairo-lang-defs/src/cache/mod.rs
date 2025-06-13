@@ -1754,6 +1754,7 @@ struct VirtualFileCached {
     content: String,
     code_mappings: Vec<CodeMapping>,
     kind: FileKind,
+    original_item_removed: bool,
 }
 
 impl VirtualFileCached {
@@ -1764,6 +1765,7 @@ impl VirtualFileCached {
             content: String::from(&*(virtual_file.content)),
             code_mappings: virtual_file.code_mappings.to_vec(),
             kind: virtual_file.kind.clone(),
+            original_item_removed: virtual_file.original_item_removed,
         }
     }
     fn embed(self, ctx: &mut DefCacheLoadingContext<'_>) -> VirtualFile {
@@ -1773,6 +1775,7 @@ impl VirtualFileCached {
             content: self.content.into(),
             code_mappings: self.code_mappings.into(),
             kind: self.kind,
+            original_item_removed: self.original_item_removed,
         }
     }
 }
@@ -1836,7 +1839,6 @@ impl PluginDiagnosticCached {
     fn embed(self, ctx: &mut DefCacheLoadingContext<'_>) -> PluginDiagnostic {
         PluginDiagnostic {
             stable_ptr: self.stable_ptr.embed(ctx),
-            relative_span: None,
             message: self.message,
             severity: match self.severity {
                 SeverityCached::Error => Severity::Error,
