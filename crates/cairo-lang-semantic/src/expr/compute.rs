@@ -11,14 +11,14 @@ use cairo_lang_debug::DebugWithDb;
 use cairo_lang_defs::db::{get_all_path_leaves, validate_attributes_flat};
 use cairo_lang_defs::diagnostic_utils::StableLocation;
 use cairo_lang_defs::ids::{
-    EnumId, FunctionTitleId, GenericKind, LanguageElementId, LocalVarLongId, LookupItemId,
-    MemberId, ModuleFileId, ModuleItemId, NamedLanguageElementId, StatementConstLongId,
-    StatementItemId, StatementUseLongId, TraitFunctionId, TraitId, VarId,
+    FunctionTitleId, GenericKind, LanguageElementId, LocalVarLongId, LookupItemId, MemberId,
+    ModuleFileId, ModuleItemId, NamedLanguageElementId, StatementConstLongId, StatementItemId,
+    StatementUseLongId, TraitFunctionId, TraitId, VarId,
 };
 use cairo_lang_defs::plugin::{InlineMacroExprPlugin, MacroPluginMetadata};
-use cairo_lang_diagnostics::{Maybe, ToOption, skip_diagnostic};
+use cairo_lang_diagnostics::{Maybe, skip_diagnostic};
 use cairo_lang_filesystem::cfg::CfgSet;
-use cairo_lang_filesystem::ids::{FileKind, FileLongId, VirtualFile};
+use cairo_lang_filesystem::ids::{CodeMapping, FileKind, FileLongId, VirtualFile};
 use cairo_lang_proc_macros::DebugWithDb;
 use cairo_lang_syntax::node::ast::{
     BinaryOperator, BlockOrIf, ClosureParamWrapper, ExprPtr, OptionReturnTypeClause, PatternListOr,
@@ -147,6 +147,15 @@ enum InnerContextKind {
     For,
     /// Context inside a `closure`
     Closure,
+}
+
+/// The result of expanding an inline macro.
+#[derive(Debug, Clone)]
+struct InlineMacroExpansion {
+    pub content: String,
+    pub name: String,
+    pub code_mappings: Vec<CodeMapping>,
+    pub is_plugin_macro: bool,
 }
 
 /// Context for computing the semantic model of expression trees.
@@ -465,7 +474,7 @@ pub fn maybe_compute_expr_semantic(
         ast::Expr::ErrorPropagate(expr) => compute_expr_error_propagate_semantic(ctx, expr),
         ast::Expr::InlineMacro(expr) => compute_expr_inline_macro_semantic(ctx, expr),
         ast::Expr::Missing(_) | ast::Expr::FieldInitShorthand(_) => {
-            Err(ctx.diagnostics.report(syntax.stable_ptr(db), Unsupported))
+            Err(ctx.diagnostics.report(syntax.stable_ptr(db), SemanticDiagnosticKind::Unsupported))
         }
         ast::Expr::Indexed(expr) => compute_expr_indexed_semantic(ctx, expr),
         ast::Expr::FixedSizeArray(expr) => compute_expr_fixed_size_array_semantic(ctx, expr),
@@ -475,10 +484,11 @@ pub fn maybe_compute_expr_semantic(
     }
 }
 
-fn compute_expr_inline_macro_semantic(
+/// Expands an inline macro invocation and returns the generated code and related metadata.
+fn expand_inline_macro(
     ctx: &mut ComputationContext<'_>,
     syntax: &ast::ExprInlineMacro,
-) -> Maybe<Expr> {
+) -> Maybe<InlineMacroExpansion> {
     let db = ctx.db;
     let macro_name = syntax.path(db).identifier(ctx.db).to_string();
     let crate_id = ctx.resolver.owning_crate_id;
@@ -506,112 +516,132 @@ fn compute_expr_inline_macro_semantic(
         NotFoundItemType::Macro,
         ResolutionContext::Statement(&mut ctx.environment),
     );
-    let inference_id = ctx.resolver.inference().inference_id;
-    let prev_macro_resolver_data = ctx.resolver.macro_call_data.clone();
-    let callsite_resolver = ctx.resolver.data.clone_with_inference_id(ctx.db, inference_id);
-    let (content, name, mappings, is_macro_rule) =
-        if let Ok(ResolvedGenericItem::Macro(macro_declaration_id)) = user_defined_macro {
-            let macro_rules = ctx.db.macro_declaration_rules(macro_declaration_id)?;
-            let Some((rule, (captures, placeholder_to_rep_id))) =
-                macro_rules.iter().find_map(|rule| {
-                    is_macro_rule_match(ctx.db, rule, &syntax.arguments(db)).map(|res| (rule, res))
-                })
-            else {
-                return Err(ctx.diagnostics.report(
-                    syntax.stable_ptr(ctx.db),
-                    InlineMacroNoMatchingRule(macro_name.into()),
-                ));
-            };
-            let mut matcher_ctx =
-                MatcherContext { captures, placeholder_to_rep_id, ..Default::default() };
-            let expanded_code = expand_macro_rule(ctx.db, rule, &mut matcher_ctx)?;
-
-            let macro_defsite_resolver_data =
-                ctx.db.macro_declaration_resolver_data(macro_declaration_id)?;
-            let parent_macro_call_data = ctx.resolver.macro_call_data.clone();
-            ctx.resolver.macro_call_data = Some(ResolverMacroData {
-                defsite_data: macro_defsite_resolver_data,
-                callsite_data: callsite_resolver
-                    .clone_with_inference_id(ctx.db, inference_id)
-                    .into(),
-                expansion_result: expanded_code.clone().into(),
-                parent_macro_call_data: parent_macro_call_data.map(|data| data.into()),
-            });
-            (expanded_code.text, macro_name.into(), expanded_code.code_mappings, true)
-        } else if let Some(macro_plugin_id) =
-            ctx.db.crate_inline_macro_plugins(crate_id).get(&macro_name).cloned()
-        {
-            let macro_plugin = ctx.db.lookup_intern_inline_macro_plugin(macro_plugin_id);
-            let result = macro_plugin.generate_code(
-                db,
-                syntax,
-                &MacroPluginMetadata {
-                    cfg_set: &ctx.cfg_set,
-                    declared_derives: &ctx.db.declared_derives(crate_id),
-                    allowed_features: &ctx.resolver.data.feature_config.allowed_features,
-                    edition: ctx.resolver.settings.edition,
-                },
-            );
-            let mut diag_added = None;
-            for diagnostic in result.diagnostics {
-                diag_added = match diagnostic.inner_span {
-                    None => Some(
-                        ctx.diagnostics.report(diagnostic.stable_ptr, PluginDiagnostic(diagnostic)),
-                    ),
-                    Some((offset, width)) => Some(ctx.diagnostics.report_with_inner_span(
-                        diagnostic.stable_ptr,
-                        (offset, width),
-                        PluginDiagnostic(diagnostic),
-                    )),
-                }
-            }
-
-            let Some(code) = result.code else {
-                return Err(diag_added.unwrap_or_else(|| {
-                    ctx.diagnostics
-                        .report(syntax.stable_ptr(ctx.db), InlineMacroNotFound(macro_name.into()))
-                }));
-            };
-            (code.content, code.name, code.code_mappings, false)
-        } else {
+    if let Ok(ResolvedGenericItem::Macro(macro_declaration_id)) = user_defined_macro {
+        let macro_rules = ctx.db.macro_declaration_rules(macro_declaration_id)?;
+        let Some((rule, (captures, placeholder_to_rep_id))) = macro_rules.iter().find_map(|rule| {
+            is_macro_rule_match(ctx.db, rule, &syntax.arguments(db)).map(|res| (rule, res))
+        }) else {
             return Err(ctx.diagnostics.report(
                 syntax.stable_ptr(ctx.db),
-                InlineMacroNotFound(
-                    syntax.path(db).as_syntax_node().get_text_without_trivia(db).into(),
-                ),
+                InlineMacroNoMatchingRule(macro_name.clone().into()),
             ));
         };
+        let mut matcher_ctx =
+            MatcherContext { captures, placeholder_to_rep_id, ..Default::default() };
+        let expanded_code = expand_macro_rule(ctx.db, rule, &mut matcher_ctx)?;
+        Ok(InlineMacroExpansion {
+            content: expanded_code.text,
+            name: macro_name.clone(),
+            code_mappings: expanded_code.code_mappings,
+            is_plugin_macro: false,
+        })
+    } else if let Some(macro_plugin_id) =
+        ctx.db.crate_inline_macro_plugins(crate_id).get(&macro_name).cloned()
+    {
+        let macro_plugin = ctx.db.lookup_intern_inline_macro_plugin(macro_plugin_id);
+        let result = macro_plugin.generate_code(
+            db,
+            syntax,
+            &MacroPluginMetadata {
+                cfg_set: &ctx.cfg_set,
+                declared_derives: &ctx.db.declared_derives(crate_id),
+                allowed_features: &ctx.resolver.data.feature_config.allowed_features,
+                edition: ctx.resolver.settings.edition,
+            },
+        );
+        let mut diag_added = None;
+        for diagnostic in result.diagnostics {
+            diag_added = match diagnostic.inner_span {
+                None => Some(
+                    ctx.diagnostics.report(diagnostic.stable_ptr, PluginDiagnostic(diagnostic)),
+                ),
+                Some((offset, width)) => Some(ctx.diagnostics.report_with_inner_span(
+                    diagnostic.stable_ptr,
+                    (offset, width),
+                    PluginDiagnostic(diagnostic),
+                )),
+            }
+        }
+        let Some(code) = result.code else {
+            return Err(diag_added.unwrap_or_else(|| {
+                ctx.diagnostics
+                    .report(syntax.stable_ptr(ctx.db), InlineMacroNotFound(macro_name.into()))
+            }));
+        };
+        Ok(InlineMacroExpansion {
+            content: code.content,
+            name: code.name.to_string(),
+            code_mappings: code.code_mappings,
+            is_plugin_macro: true,
+        })
+    } else {
+        return Err(ctx.diagnostics.report(
+            syntax.stable_ptr(db),
+            InlineMacroNotFound(
+                syntax.path(db).as_syntax_node().get_text_without_trivia(db).into(),
+            ),
+        ));
+    }
+}
 
-    // Create a file
+/// Expands and computes the semantic model of an inline macro used in expression position.
+fn compute_expr_inline_macro_semantic(
+    ctx: &mut ComputationContext<'_>,
+    syntax: &ast::ExprInlineMacro,
+) -> Maybe<Expr> {
+    let db = ctx.db;
+    let prev_macro_call_data = ctx.resolver.macro_call_data.clone();
+    let InlineMacroExpansion { content, name, code_mappings: mappings, is_plugin_macro } =
+        expand_inline_macro(ctx, syntax)?;
+    if !is_plugin_macro {
+        let user_defined_macro = ctx.resolver.resolve_generic_path(
+            &mut Default::default(),
+            &syntax.path(db),
+            NotFoundItemType::Macro,
+            ResolutionContext::Statement(&mut ctx.environment),
+        );
+        if let Ok(ResolvedGenericItem::Macro(macro_declaration_id)) = user_defined_macro {
+            let macro_defsite_resolver_data =
+                ctx.db.macro_declaration_resolver_data(macro_declaration_id)?;
+            let inference_id = ctx.resolver.inference().inference_id;
+            let callsite_resolver = ctx.resolver.data.clone_with_inference_id(ctx.db, inference_id);
+            let parent_macro_call_data = ctx.resolver.macro_call_data.clone();
+            ctx.resolver.macro_call_data = Some(ResolverMacroData {
+                defsite_module_file_id: macro_defsite_resolver_data.module_file_id,
+                callsite_module_file_id: callsite_resolver.module_file_id,
+                expansion_result: Arc::new(MacroExpansionResult {
+                    text: content.clone(),
+                    code_mappings: mappings.clone(),
+                }),
+                parent_macro_call_data: parent_macro_call_data.map(|data| data.into()),
+            });
+        }
+    }
     let new_file = FileLongId::Virtual(VirtualFile {
         parent: Some(syntax.stable_ptr(ctx.db).untyped().file_id(ctx.db)),
-        name,
+        name: name.clone().into(),
         content: content.clone().into(),
         code_mappings: mappings.clone().into(),
         kind: FileKind::Expr,
+        original_item_removed: true,
     })
     .intern(ctx.db);
     let expr_syntax = ctx.db.file_expr_syntax(new_file)?;
-    let expr = if is_macro_rule {
-        let expr_parser_diagnostics = ctx.db.file_syntax_diagnostics(new_file);
-        for parser_diagnostic in
-            &expr_parser_diagnostics.get_diagnostics_without_duplicates(ctx.db.elongate())
-        {
+    let expr_parser_diagnostics = ctx.db.file_syntax_diagnostics(new_file);
+    let parser_diags: Vec<_> =
+        expr_parser_diagnostics.get_diagnostics_without_duplicates(ctx.db.elongate());
+    if !parser_diags.is_empty() {
+        for parser_diagnostic in parser_diags {
             ctx.diagnostics.report(
-                expr_syntax.stable_ptr(ctx.db),
+                syntax.stable_ptr(ctx.db),
                 SemanticDiagnosticKind::MacroGeneratedCodeParserDiagnostic(
                     parser_diagnostic.clone(),
                 ),
             );
         }
-        if ctx.diagnostics.error_count > 0 {
-            return Err(skip_diagnostic());
-        }
-        ctx.run_in_macro_subscope(
-            |ctx| compute_expr_semantic(ctx, &expr_syntax),
-            MacroExpansionResult { text: content, code_mappings: mappings },
-        )
-    } else {
+        return Err(skip_diagnostic());
+    }
+    let expr = if is_plugin_macro {
         let prev_resolver_modifiers_suppression = ctx.resolver.suppress_modifiers_diagnostics;
         ctx.resolver.set_suppress_modifiers_diagnostics(true);
         let result = ctx.run_in_macro_subscope(
@@ -620,9 +650,83 @@ fn compute_expr_inline_macro_semantic(
         );
         ctx.resolver.set_suppress_modifiers_diagnostics(prev_resolver_modifiers_suppression);
         result
+    } else {
+        ctx.run_in_macro_subscope(
+            |ctx| compute_expr_semantic(ctx, &expr_syntax),
+            MacroExpansionResult { text: content, code_mappings: mappings },
+        )
     };
-    ctx.resolver.macro_call_data = prev_macro_resolver_data;
+    ctx.resolver.macro_call_data = prev_macro_call_data;
     Ok(expr.expr)
+}
+
+/// Expands an inline macro used in statement position, computes its semantic model, and extends
+/// `statements` with it.
+fn expand_macro_for_statement(
+    ctx: &mut ComputationContext<'_>,
+    syntax: &ast::ExprInlineMacro,
+    statement_stable_ptr: ast::StatementPtr,
+    statements: &mut Vec<StatementId>,
+) -> Maybe<()> {
+    let prev_macro_call_data = ctx.resolver.macro_call_data.clone();
+    let InlineMacroExpansion { content, name, code_mappings: mappings, is_plugin_macro } =
+        expand_inline_macro(ctx, syntax)?;
+    let new_file_long_id = FileLongId::Virtual(VirtualFile {
+        parent: Some(syntax.stable_ptr(ctx.db).untyped().file_id(ctx.db)),
+        name: name.clone().into(),
+        content: content.clone().into(),
+        code_mappings: mappings.clone().into(),
+        kind: FileKind::Expr,
+        original_item_removed: true,
+    });
+    let new_file_id = new_file_long_id.clone().intern(ctx.db);
+    let statement_list =
+        cairo_lang_parser::db::file_statement_list_syntax(ctx.db.upcast(), new_file_id)?;
+    let parsed_statements = statement_list.elements(ctx.db);
+    let tail = get_tail_expression(ctx.db, parsed_statements.as_slice());
+    if (parsed_statements.is_empty() && tail.is_some())
+        || (parsed_statements.len() == 1 && matches!(parsed_statements[0], ast::Statement::Expr(_)))
+    {
+        // Fallback to expression macro expansion.
+        let expr = compute_expr_inline_macro_semantic(ctx, syntax)?;
+        let expr_id = ctx.arenas.exprs.alloc(expr);
+        statements.push(ctx.arenas.statements.alloc(semantic::Statement::Expr(
+            semantic::StatementExpr { expr: expr_id, stable_ptr: statement_stable_ptr },
+        )));
+        return Ok(());
+    }
+    if is_plugin_macro {
+        let prev_resolver_modifiers_suppression = ctx.resolver.suppress_modifiers_diagnostics;
+        ctx.resolver.set_suppress_modifiers_diagnostics(true);
+        let result = ctx.run_in_macro_subscope(
+            |ctx| {
+                let ids = compute_statement_list_semantic(ctx, parsed_statements.clone());
+                statements.extend(ids);
+                Ok(())
+            },
+            MacroExpansionResult { text: content, code_mappings: mappings },
+        );
+        ctx.resolver.set_suppress_modifiers_diagnostics(prev_resolver_modifiers_suppression);
+        ctx.resolver.macro_call_data = prev_macro_call_data;
+        result
+    } else {
+        let result = ctx.run_in_macro_subscope(
+            |ctx| {
+                let mut ids = compute_statement_list_semantic(ctx, parsed_statements.clone());
+                if let Some(tail_expr) = tail {
+                    let expr = compute_expr_semantic(ctx, &tail_expr);
+                    ids.push(ctx.arenas.statements.alloc(semantic::Statement::Expr(
+                        semantic::StatementExpr { expr: expr.id, stable_ptr: statement_stable_ptr },
+                    )));
+                }
+                statements.extend(ids);
+                Ok(())
+            },
+            MacroExpansionResult { text: content, code_mappings: mappings },
+        );
+        ctx.resolver.macro_call_data = prev_macro_call_data;
+        result
+    }
 }
 
 fn compute_expr_unary_semantic(
@@ -1283,13 +1387,25 @@ pub fn compute_root_expr(
     Ok(res)
 }
 
+/// Computes the semantic model for a list of statements, flattening the result.
+pub fn compute_statement_list_semantic(
+    ctx: &mut ComputationContext<'_>,
+    statements: Vec<ast::Statement>,
+) -> Vec<StatementId> {
+    let mut statement_ids = Vec::new();
+    for statement_syntax in statements {
+        compute_and_append_statement_semantic(ctx, statement_syntax, &mut statement_ids)
+            .unwrap_or_default();
+    }
+    statement_ids
+}
+
 /// Computes the semantic model of an expression of type [ast::ExprBlock].
 pub fn compute_expr_block_semantic(
     ctx: &mut ComputationContext<'_>,
     syntax: &ast::ExprBlock,
 ) -> Maybe<Expr> {
     let db = ctx.db;
-
     ctx.run_in_subscope(|new_ctx| {
         let mut statements = syntax.statements(db).elements(db);
         // Remove the tail expression, if exists.
@@ -1300,12 +1416,7 @@ pub fn compute_expr_block_semantic(
         }
 
         // Convert statements to semantic model.
-        let statements_semantic: Vec<_> = statements
-            .into_iter()
-            .filter_map(|statement_syntax| {
-                compute_statement_semantic(new_ctx, statement_syntax).to_option()
-            })
-            .collect();
+        let statements_semantic = compute_statement_list_semantic(new_ctx, statements);
 
         // Convert tail expression (if exists) to semantic model.
         let tail_semantic_expr = tail.map(|tail_expr| compute_expr_semantic(new_ctx, &tail_expr));
@@ -1817,12 +1928,7 @@ fn compute_loop_body_semantic(
         }
 
         // Convert statements to semantic model.
-        let statements_semantic: Vec<_> = statements
-            .into_iter()
-            .filter_map(|statement_syntax| {
-                compute_statement_semantic(new_ctx, statement_syntax).to_option()
-            })
-            .collect();
+        let statements_semantic = compute_statement_list_semantic(new_ctx, statements);
         let tail = tail.map(|tail| compute_expr_semantic(new_ctx, &tail));
         if let Some(tail) = &tail {
             if !tail.ty().is_missing(db) && !tail.ty().is_unit(db) && tail.ty() != never_ty(db) {
@@ -1987,12 +2093,7 @@ fn compute_closure_body_semantic(
     }
 
     // Convert statements to semantic model.
-    let statements_semantic: Vec<_> = statements
-        .into_iter()
-        .filter_map(|statement_syntax| {
-            compute_statement_semantic(ctx, statement_syntax).to_option()
-        })
-        .collect();
+    let statements_semantic = compute_statement_list_semantic(ctx, statements);
     // Convert tail expression (if exists) to semantic model.
     let tail_semantic_expr = tail.map(|tail_expr| compute_expr_semantic(ctx, &tail_expr));
     let ty = if let Some(t) = &tail_semantic_expr {
@@ -2080,9 +2181,9 @@ fn compute_expr_error_propagate_semantic(
     }
     Ok(Expr::PropagateError(ExprPropagateError {
         inner: inner_expr.id,
-        ok_variant: inner_expr_err_prop_ty.ok_variant().clone(),
-        err_variant: inner_expr_err_variant.clone(),
-        func_err_variant: func_err_variant.clone(),
+        ok_variant: *inner_expr_err_prop_ty.ok_variant(),
+        err_variant: *inner_expr_err_variant,
+        func_err_variant: *func_err_variant,
         stable_ptr: syntax.stable_ptr(db).into(),
     }))
 }
@@ -2155,7 +2256,7 @@ fn compute_method_function_call_data(
     // found. If >0 candidates are found these are ignored as they may describe, e.g., "errors"
     // indicating certain traits/impls/functions don't match, which is OK as we only look for one.
     let mut inference_errors = vec![];
-    let (candidates, mut fixed_expr, fixed_ty) = get_method_function_candidates(
+    let (candidates, mut fixed_expr, fixed_ty, deref_used) = get_method_function_candidates(
         ctx,
         candidate_traits,
         &func_name,
@@ -2192,6 +2293,17 @@ fn compute_method_function_call_data(
 
     let signature = ctx.db.trait_function_signature(trait_function_id).unwrap();
     let first_param = signature.params.into_iter().next().unwrap();
+
+    if deref_used && first_param.mutability == Mutability::Reference {
+        return Err(no_implementation_diagnostic(
+            self_ty,
+            func_name,
+            TraitInferenceErrors { traits_and_errors: inference_errors },
+        )
+        .map(|diag| ctx.diagnostics.report(method_syntax, diag))
+        .unwrap_or_else(skip_diagnostic));
+    }
+
     for _ in 0..n_snapshots {
         let ty = TypeLongId::Snapshot(fixed_expr.ty()).intern(ctx.db);
         let expr = Expr::Snapshot(ExprSnapshot { inner: fixed_expr.id, ty, stable_ptr: expr_ptr });
@@ -2202,7 +2314,8 @@ fn compute_method_function_call_data(
 }
 
 /// Return candidates for method functions that match the given arguments.
-/// Also returns the expression to be used as self for the method call and its type.
+/// Also returns the expression to be used as self for the method call, its type and whether deref
+/// was used.
 #[expect(clippy::too_many_arguments)]
 fn get_method_function_candidates(
     ctx: &mut ComputationContext<'_>,
@@ -2213,7 +2326,8 @@ fn get_method_function_candidates(
     expr_ptr: ExprPtr,
     self_ty: TypeId,
     inference_errors: &mut Vec<(TraitFunctionId, InferenceError)>,
-) -> Result<(Vec<TraitFunctionId>, ExprAndId, TypeId), cairo_lang_diagnostics::DiagnosticAdded> {
+) -> Result<(Vec<TraitFunctionId>, ExprAndId, TypeId, bool), cairo_lang_diagnostics::DiagnosticAdded>
+{
     let mut candidates = filter_candidate_traits(
         ctx,
         inference_errors,
@@ -2223,7 +2337,7 @@ fn get_method_function_candidates(
         method_syntax,
     );
     if !candidates.is_empty() {
-        return Ok((candidates, self_expr, self_ty));
+        return Ok((candidates, self_expr, self_ty, false));
     }
 
     let mut fixed_expr = self_expr;
@@ -2268,7 +2382,7 @@ fn get_method_function_candidates(
         }
     }
 
-    Ok((candidates, fixed_expr, fixed_ty))
+    Ok((candidates, fixed_expr, fixed_ty, true))
 }
 
 /// Computes the semantic model of a pattern.
@@ -2331,22 +2445,17 @@ fn maybe_compute_pattern_semantic(
         }
         ast::Pattern::Enum(enum_pattern) => {
             let path = enum_pattern.path(db);
-            let item = ctx.resolver.resolve_generic_path(
+            let item = ctx.resolver.resolve_concrete_path_ex(
                 ctx.diagnostics,
                 &path,
                 NotFoundItemType::Identifier,
                 ResolutionContext::Statement(&mut ctx.environment),
             )?;
-            let generic_variant = try_extract_matches!(item, ResolvedGenericItem::Variant)
+            let concrete_variant = try_extract_matches!(item, ResolvedConcreteItem::Variant)
                 .ok_or_else(|| ctx.diagnostics.report(path.stable_ptr(db), NotAVariant))?;
 
-            let (concrete_variant, n_snapshots) =
-                extract_concrete_variant_from_pattern_and_validate(
-                    ctx,
-                    pattern_syntax,
-                    ty,
-                    generic_variant,
-                )?;
+            let n_snapshots =
+                validate_pattern_type_and_args(ctx, pattern_syntax, ty, concrete_variant)?;
 
             // Compute inner pattern.
             let inner_ty = wrap_in_snapshots(ctx.db, concrete_variant.ty, n_snapshots);
@@ -2372,23 +2481,26 @@ fn maybe_compute_pattern_semantic(
             })
         }
         ast::Pattern::Path(path) => {
-            let item_result = ctx.resolver.resolve_generic_path(
+            let item_result = ctx.resolver.resolve_generic_path_with_args(
                 &mut Default::default(),
                 path,
                 NotFoundItemType::Identifier,
                 ResolutionContext::Statement(&mut ctx.environment),
             );
-            if let Ok(item) = item_result {
-                if let Some(generic_variant) =
-                    try_extract_matches!(item, ResolvedGenericItem::Variant)
-                {
-                    let (concrete_variant, _n_snapshots) =
-                        extract_concrete_variant_from_pattern_and_validate(
-                            ctx,
-                            pattern_syntax,
-                            ty,
-                            generic_variant,
-                        )?;
+            if let Ok(ResolvedGenericItem::Variant(_)) = item_result {
+                // If the path resolves to a variant, it might still be a generic param, so we
+                // resolve it as a concrete path.
+                // Resolveing as concrete path first might create vars which will not be inferred so
+                // we use the generic path first.
+                let item = ctx.resolver.resolve_concrete_path_ex(
+                    &mut Default::default(),
+                    path,
+                    NotFoundItemType::Identifier,
+                    ResolutionContext::Statement(&mut ctx.environment),
+                );
+                if let Ok(ResolvedConcreteItem::Variant(concrete_variant)) = item {
+                    let _n_snapshots =
+                        validate_pattern_type_and_args(ctx, pattern_syntax, ty, concrete_variant)?;
                     return Ok(Pattern::EnumVariant(PatternEnumVariant {
                         variant: concrete_variant,
                         inner_pattern: None,
@@ -2560,7 +2672,7 @@ fn maybe_compute_pattern_semantic(
                 ctx,
                 pattern_syntax,
                 ty,
-                enum_expr.variant.concrete_enum_id.enum_id(ctx.db),
+                enum_expr.variant.concrete_enum_id,
             )?;
 
             Pattern::EnumVariant(PatternEnumVariant {
@@ -2579,7 +2691,7 @@ fn maybe_compute_pattern_semantic(
                 ctx,
                 pattern_syntax,
                 ty,
-                enum_expr.variant.concrete_enum_id.enum_id(ctx.db),
+                enum_expr.variant.concrete_enum_id,
             )?;
 
             Pattern::EnumVariant(PatternEnumVariant {
@@ -2711,11 +2823,10 @@ fn extract_concrete_enum_from_pattern_and_validate(
     ctx: &mut ComputationContext<'_>,
     pattern: &ast::Pattern,
     ty: TypeId,
-    enum_id: EnumId,
+    concrete_enum_id: ConcreteEnumId,
 ) -> Maybe<(ConcreteEnumId, usize)> {
-    let db = ctx.db;
     // Peel all snapshot wrappers.
-    let (n_snapshots, long_ty) = finalized_snapshot_peeled_ty(ctx, ty, pattern.stable_ptr(db))?;
+    let (n_snapshots, long_ty) = finalized_snapshot_peeled_ty(ctx, ty, pattern.stable_ptr(ctx.db))?;
 
     // Check that type is an enum, and get the concrete enum from it.
     let concrete_enum = try_extract_matches!(long_ty, TypeLongId::Concrete)
@@ -2725,30 +2836,55 @@ fn extract_concrete_enum_from_pattern_and_validate(
             // Don't add a diagnostic if the type is missing.
             // A diagnostic should've already been added.
             ty.check_not_missing(ctx.db)?;
-            Err(ctx.diagnostics.report(pattern.stable_ptr(db), UnexpectedEnumPattern(ty)))
+            Err(ctx.diagnostics.report(pattern.stable_ptr(ctx.db), UnexpectedEnumPattern(ty)))
         })?;
     // Check that these are the same enums.
-    if enum_id != concrete_enum.enum_id(ctx.db) {
+    let pattern_enum = concrete_enum_id.enum_id(ctx.db);
+    if pattern_enum != concrete_enum.enum_id(ctx.db) {
         return Err(ctx.diagnostics.report(
-            pattern.stable_ptr(db),
-            WrongEnum { expected_enum: concrete_enum.enum_id(ctx.db), actual_enum: enum_id },
+            pattern.stable_ptr(ctx.db),
+            WrongEnum { expected_enum: concrete_enum.enum_id(ctx.db), actual_enum: pattern_enum },
         ));
     }
     Ok((concrete_enum, n_snapshots))
 }
 
 /// Validates that the semantic type of an enum pattern is an enum.
-/// After that finds the concrete variant in the patter, and verifies it has args if needed.
-/// Returns the concrete variant and the number of snapshots.
-fn extract_concrete_variant_from_pattern_and_validate(
+/// After that finds the concrete variant in the pattern, and verifies it has args if needed.
+/// Returns the number of snapshots.
+fn validate_pattern_type_and_args(
     ctx: &mut ComputationContext<'_>,
     pattern: &ast::Pattern,
     ty: TypeId,
-    generic_variant: semantic::Variant,
-) -> Maybe<(ConcreteVariant, usize)> {
-    let (concrete_enum, n_snapshots) =
-        extract_concrete_enum_from_pattern_and_validate(ctx, pattern, ty, generic_variant.enum_id)?;
+    concrete_variant: ConcreteVariant,
+) -> Maybe<usize> {
     let db = ctx.db;
+
+    let (concrete_enum, n_snapshots) = extract_concrete_enum_from_pattern_and_validate(
+        ctx,
+        pattern,
+        ty,
+        concrete_variant.concrete_enum_id,
+    )?;
+
+    if let Err(err_set) = ctx.resolver.inference().conform_generic_args(
+        &concrete_variant.concrete_enum_id.lookup_intern(db).generic_args,
+        &concrete_enum.lookup_intern(db).generic_args,
+    ) {
+        let diag_added = ctx.diagnostics.report(
+            pattern.stable_ptr(db),
+            InternalInferenceError(InferenceError::TypeKindMismatch {
+                ty0: ty,
+                ty1: TypeLongId::Concrete(ConcreteTypeId::Enum(concrete_variant.concrete_enum_id))
+                    .intern(db),
+            }),
+        );
+        ctx.resolver.inference().consume_reported_error(err_set, diag_added);
+    };
+
+    let generic_variant = db
+        .variant_semantic(concrete_variant.concrete_enum_id.enum_id(db), concrete_variant.id)
+        .expect("concrete variant has to exist");
 
     let needs_args = generic_variant.ty != unit_ty(db);
     let has_args = matches!(
@@ -2769,12 +2905,7 @@ fn extract_concrete_variant_from_pattern_and_validate(
         ctx.diagnostics.report(pattern.stable_ptr(db), PatternMissingArgs(path));
     }
 
-    // TODO(lior): Should we report a diagnostic here?
-    let concrete_variant = db
-        .concrete_enum_variant(concrete_enum, &generic_variant)
-        .map_err(|_| ctx.diagnostics.report(pattern.stable_ptr(db), UnknownEnum))?;
-
-    Ok((concrete_variant, n_snapshots))
+    Ok(n_snapshots)
 }
 
 /// Creates a local variable pattern.
@@ -3461,7 +3592,7 @@ fn enrich_members(
             }
         }
     }
-    Ok(())
+    Ok::<(), cairo_lang_diagnostics::DiagnosticAdded>(())
 }
 
 /// Peels snapshots from a type and making sure it is fully not a variable type.
@@ -3801,13 +3932,14 @@ fn check_named_arguments(
     res
 }
 
-/// Computes the semantic model of a statement (excluding tail-expression).
-pub fn compute_statement_semantic(
+/// Computes the semantic model for a statement and appends the resulting statement IDs to the
+/// provided vector.
+pub fn compute_and_append_statement_semantic(
     ctx: &mut ComputationContext<'_>,
     syntax: ast::Statement,
-) -> Maybe<StatementId> {
+    statements: &mut Vec<StatementId>,
+) -> Maybe<()> {
     let db = ctx.db;
-
     let crate_id = ctx.resolver.owning_crate_id;
 
     // As for now, statement attributes does not have any semantic affect, so we only validate they
@@ -3818,7 +3950,7 @@ pub fn compute_statement_semantic(
         .data
         .feature_config
         .override_with(extract_item_feature_config(db, crate_id, &syntax, ctx.diagnostics));
-    let statement = match &syntax {
+    let _ = match &syntax {
         ast::Statement::Let(let_syntax) => {
             let rhs_syntax = &let_syntax.rhs(db);
             let (rhs_expr, ty) = match let_syntax.type_clause(db) {
@@ -3854,6 +3986,24 @@ pub fn compute_statement_semantic(
             };
             let rhs_expr_id = rhs_expr.id;
 
+            let else_clause = match let_syntax.let_else_clause(db) {
+                ast::OptionLetElseClause::Empty(_) => None,
+                ast::OptionLetElseClause::LetElseClause(else_clause) => {
+                    let else_block_syntax = else_clause.else_block(db);
+                    let else_block_stable_ptr = else_block_syntax.stable_ptr(db);
+
+                    let else_block =
+                        compute_expr_semantic(ctx, &ast::Expr::Block(else_block_syntax));
+
+                    if else_block.ty() != never_ty(db) {
+                        // Report the error, but continue processing.
+                        ctx.diagnostics.report(else_block_stable_ptr, NonNeverLetElseType);
+                    }
+
+                    Some(else_block.id)
+                }
+            };
+
             let pattern = compute_pattern_semantic(
                 ctx,
                 &let_syntax.pattern(db),
@@ -3875,14 +4025,27 @@ pub fn compute_statement_semantic(
                 }
                 ctx.semantic_defs.insert(var_def.id(), var_def);
             }
-            semantic::Statement::Let(semantic::StatementLet {
-                pattern: pattern.id,
-                expr: rhs_expr_id,
-                stable_ptr: syntax.stable_ptr(db),
-            })
+            statements.push(ctx.arenas.statements.alloc(semantic::Statement::Let(
+                semantic::StatementLet {
+                    pattern: pattern.id,
+                    expr: rhs_expr_id,
+                    else_clause,
+                    stable_ptr: syntax.stable_ptr(db),
+                },
+            )));
+            Ok(()) as Maybe<()>
         }
         ast::Statement::Expr(stmt_expr_syntax) => {
             let expr_syntax = stmt_expr_syntax.expr(db);
+            if let ast::Expr::InlineMacro(inline_macro_syntax) = &expr_syntax {
+                expand_macro_for_statement(
+                    ctx,
+                    inline_macro_syntax,
+                    syntax.stable_ptr(db),
+                    statements,
+                )?;
+                return Ok(());
+            }
             let expr = compute_expr_semantic(ctx, &expr_syntax);
             if matches!(stmt_expr_syntax.semicolon(db), ast::OptionTerminalSemicolon::Empty(_))
                 && !matches!(
@@ -3895,7 +4058,6 @@ pub fn compute_statement_semantic(
                         | ast::Expr::For(_)
                 )
             {
-                // Point to after the expression, where the semicolon is missing.
                 ctx.diagnostics.report_after(expr_syntax.stable_ptr(db), MissingSemicolon);
             }
             let ty: TypeId = expr.ty();
@@ -3911,10 +4073,10 @@ pub fn compute_statement_semantic(
                     ctx.diagnostics.report(expr_syntax.stable_ptr(db), UnhandledMustUseFunction);
                 }
             }
-            semantic::Statement::Expr(semantic::StatementExpr {
-                expr: expr.id,
-                stable_ptr: syntax.stable_ptr(db),
-            })
+            statements.push(ctx.arenas.statements.alloc(semantic::Statement::Expr(
+                semantic::StatementExpr { expr: expr.id, stable_ptr: syntax.stable_ptr(db) },
+            )));
+            Ok(())
         }
         ast::Statement::Continue(continue_syntax) => {
             if !ctx.is_inside_loop() {
@@ -3922,9 +4084,10 @@ pub fn compute_statement_semantic(
                     .diagnostics
                     .report(continue_syntax.stable_ptr(db), ContinueOnlyAllowedInsideALoop));
             }
-            semantic::Statement::Continue(semantic::StatementContinue {
-                stable_ptr: syntax.stable_ptr(db),
-            })
+            statements.push(ctx.arenas.statements.alloc(semantic::Statement::Continue(
+                semantic::StatementContinue { stable_ptr: syntax.stable_ptr(db) },
+            )));
+            Ok(())
         }
         ast::Statement::Return(return_syntax) => {
             let (expr_option, expr_ty, stable_ptr) = match return_syntax.expr_clause(db) {
@@ -3961,10 +4124,10 @@ pub fn compute_statement_semantic(
                     |actual_ty, expected_ty| WrongReturnType { expected_ty, actual_ty },
                 );
             }
-            semantic::Statement::Return(semantic::StatementReturn {
-                expr_option,
-                stable_ptr: syntax.stable_ptr(db),
-            })
+            statements.push(ctx.arenas.statements.alloc(semantic::Statement::Return(
+                semantic::StatementReturn { expr_option, stable_ptr: syntax.stable_ptr(db) },
+            )));
+            Ok(())
         }
         ast::Statement::Break(break_syntax) => {
             let (expr_option, ty, stable_ptr) = match break_syntax.expr_clause(db) {
@@ -4009,10 +4172,10 @@ pub fn compute_statement_semantic(
                 }
             }
 
-            semantic::Statement::Break(semantic::StatementBreak {
-                expr_option,
-                stable_ptr: syntax.stable_ptr(db),
-            })
+            statements.push(ctx.arenas.statements.alloc(semantic::Statement::Break(
+                semantic::StatementBreak { expr_option, stable_ptr: syntax.stable_ptr(db) },
+            )));
+            Ok(())
         }
         ast::Statement::Item(stmt_item_syntax) => {
             let item_syntax = &stmt_item_syntax.item(db);
@@ -4127,14 +4290,16 @@ pub fn compute_statement_semantic(
                 ast::ModuleItem::Missing(_) => unreachable!("Missing type not supported."),
                 ast::ModuleItem::MacroDeclaration(_) => todo!(),
             }
-            semantic::Statement::Item(semantic::StatementItem { stable_ptr: syntax.stable_ptr(db) })
+            statements.push(ctx.arenas.statements.alloc(semantic::Statement::Item(
+                semantic::StatementItem { stable_ptr: syntax.stable_ptr(db) },
+            )));
+            Ok(())
         }
         ast::Statement::Missing(_) => todo!(),
     };
     ctx.resolver.data.feature_config.restore(feature_restore);
-    Ok(ctx.arenas.statements.alloc(statement))
+    Ok(())
 }
-
 /// Adds an item to the statement environment and reports a diagnostic if the item is already
 /// defined.
 fn add_item_to_statement_environment(

@@ -1080,27 +1080,22 @@ impl DiagnosticEntry for SemanticDiagnostic {
             SemanticDiagnosticKind::UserDefinedInlineMacrosDisabled => {
                 "User defined inline macros are disabled in the current crate.".into()
             }
+            SemanticDiagnosticKind::NonNeverLetElseType => concat!(
+                "`else` clause of `let...else` must exit the scope. ",
+                "Consider using `return`, `continue`, ..."
+            )
+            .into(),
         }
     }
     fn location(&self, db: &Self::DbType) -> DiagnosticLocation {
-        match &self.kind {
-            SemanticDiagnosticKind::PluginDiagnostic(diag) => {
-                if let Some(relative_span) = diag.relative_span {
-                    return self.stable_location.diagnostic_location_with_offsets(
-                        db,
-                        relative_span.start.as_u32(),
-                        relative_span.end.as_u32(),
-                    );
-                }
-            }
-            SemanticDiagnosticKind::MacroGeneratedCodeParserDiagnostic(parser_diagnostic) => {
-                return DiagnosticLocation {
-                    file_id: parser_diagnostic.file_id,
-                    span: parser_diagnostic.span,
-                };
-            }
-            _ => (),
-        }
+        if let SemanticDiagnosticKind::MacroGeneratedCodeParserDiagnostic(parser_diagnostic) =
+            &self.kind
+        {
+            return DiagnosticLocation {
+                file_id: parser_diagnostic.file_id,
+                span: parser_diagnostic.span,
+            };
+        };
 
         let mut location = self.stable_location.diagnostic_location(db);
         if self.after {
@@ -1529,6 +1524,7 @@ pub enum SemanticDiagnosticKind {
     PatternMissingArgs(ast::ExprPath),
     UndefinedMacroPlaceholder(String),
     UserDefinedInlineMacrosDisabled,
+    NonNeverLetElseType,
 }
 
 /// The kind of an expression with multiple possible return types.

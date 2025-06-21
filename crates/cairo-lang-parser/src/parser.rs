@@ -176,6 +176,26 @@ impl<'a> Parser<'a> {
         Expr::from_syntax_node(db, SyntaxNode::new_root(db, file_id, green.0))
     }
 
+    /// Parses a file as a list of statements.
+    pub fn parse_file_statement_list(
+        db: &'a dyn SyntaxGroup,
+        diagnostics: &'a mut DiagnosticsBuilder<ParserDiagnostic>,
+        file_id: FileId,
+        text: &'a str,
+    ) -> StatementList {
+        let mut parser = Parser::new(db, file_id, text, diagnostics);
+        let statements = StatementList::new_green(
+            db,
+            parser.parse_list(Self::try_parse_statement, Self::is_eof, "statement"),
+        );
+        StatementList::from_syntax_node(db, SyntaxNode::new_root(db, file_id, statements.0))
+    }
+
+    /// Checks if the given kind is an end of file token.
+    pub fn is_eof(kind: SyntaxKind) -> bool {
+        kind == SyntaxKind::TerminalEndOfFile
+    }
+
     /// Parses a token stream.
     pub fn parse_token_stream(
         db: &'a dyn SyntaxGroup,
@@ -694,7 +714,8 @@ impl<'a> Parser<'a> {
         };
         let arrow = self.parse_token::<TerminalMatchArrow>();
         self.macro_parsing_context = MacroParsingContext::MacroExpansion;
-        let macro_body = self.parse_macro_elements();
+        let macro_body =
+            self.wrap_macro::<TerminalLBrace, TerminalRBrace, _, _>(BracedMacro::new_green);
         let semicolon = self.parse_token::<TerminalSemicolon>();
         self.macro_parsing_context = previous_macro_parsing_context;
         Ok(MacroRule::new_green(self.db, wrapped_macro, arrow, macro_body, semicolon))
@@ -2554,6 +2575,17 @@ impl<'a> Parser<'a> {
                 let type_clause = self.parse_option_type_clause();
                 let eq = self.parse_token::<TerminalEq>();
                 let rhs = self.parse_expr();
+
+                // Check if this is a let-else statement.
+                let let_else_clause: OptionLetElseClauseGreen =
+                    if self.peek().kind == SyntaxKind::TerminalElse {
+                        let else_kw = self.take::<TerminalElse>();
+                        let else_block = self.parse_block();
+                        LetElseClause::new_green(self.db, else_kw, else_block).into()
+                    } else {
+                        OptionLetElseClauseEmpty::new_green(self.db).into()
+                    };
+
                 let semicolon = self.parse_token::<TerminalSemicolon>();
                 Ok(StatementLet::new_green(
                     self.db,
@@ -2563,6 +2595,7 @@ impl<'a> Parser<'a> {
                     type_clause,
                     eq,
                     rhs,
+                    let_else_clause,
                     semicolon,
                 )
                 .into())
