@@ -12,7 +12,7 @@ use cairo_lang_semantic::items::functions::InlineConfiguration;
 use cairo_lang_utils::LookupIntern;
 use cairo_lang_utils::casts::IntoOrPanic;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
-use itertools::{izip, zip_eq};
+use itertools::zip_eq;
 
 use crate::blocks::{Blocks, BlocksBuilder};
 use crate::db::LoweringGroup;
@@ -100,9 +100,16 @@ pub struct FunctionInlinerRewriter<'db> {
     block_queue: BlockRewriteQueue,
     /// rewritten statements.
     statements: Vec<Statement>,
-
     /// The end of the current block.
     block_end: BlockEnd,
+
+    /// Indicates whether the current block should be finalized or added to the block_queue.
+    ///
+    /// When we split a block for inlining, the begging of the block should be finzalized to keep
+    /// the block_id, but the following block are created through the queue to avoid shifting
+    /// the id of the blocks in the queue.
+    finalize: bool,
+
     /// The processed statements of the current block.
     unprocessed_statements: <Vec<Statement> as IntoIterator>::IntoIter,
     /// Indicates that the inlining process was successful.
@@ -113,27 +120,20 @@ pub struct FunctionInlinerRewriter<'db> {
 
 pub struct BlockRewriteQueue {
     /// A Queue of blocks that require processing, and their id.
-    block_queue: VecDeque<(Block, bool)>,
+    block_queue: VecDeque<Block>,
     /// The new blocks that were created during the inlining.
     blocks: BlocksBuilder,
 }
 impl BlockRewriteQueue {
     /// Enqueues the block for processing and returns the block_id that this
     /// block is going to get in self.blocks.
-    fn enqueue_block(&mut self, block: Block, requires_rewrite: bool) -> BlockId {
-        self.block_queue.push_back((block, requires_rewrite));
-        BlockId(self.blocks.len() + self.block_queue.len())
+    fn enqueue_block(&mut self, block: Block) {
+        self.block_queue.push_back(block);
     }
     /// Pops a block requiring rewrites from the queue.
     /// If the block doesn't require rewrites, it is finalized and added to the blocks.
     fn dequeue(&mut self) -> Option<Block> {
-        while let Some((block, requires_rewrite)) = self.block_queue.pop_front() {
-            if requires_rewrite {
-                return Some(block);
-            }
-            self.finalize(block);
-        }
-        None
+        self.block_queue.pop_front()
     }
     /// Finalizes a block.
     fn finalize(&mut self, block: Block) {
@@ -207,7 +207,7 @@ impl<'db> FunctionInlinerRewriter<'db> {
         let mut rewriter = Self {
             variables,
             block_queue: BlockRewriteQueue {
-                block_queue: lowered.blocks.iter().map(|(_, b)| (b.clone(), true)).collect(),
+                block_queue: lowered.blocks.iter().map(|(_, b)| b.clone()).collect(),
                 blocks: BlocksBuilder::new(),
             },
             statements: vec![],
@@ -215,6 +215,7 @@ impl<'db> FunctionInlinerRewriter<'db> {
             unprocessed_statements: Default::default(),
             inlining_success: lowered.blocks.has_root(),
             calling_function_id,
+            finalize: true,
         };
 
         rewriter.variables.variables = lowered.variables.clone();
@@ -226,10 +227,17 @@ impl<'db> FunctionInlinerRewriter<'db> {
                 rewriter.rewrite(statement)?;
             }
 
-            rewriter.block_queue.finalize(Block {
+            let new_block = Block {
                 statements: std::mem::take(&mut rewriter.statements),
                 end: rewriter.block_end,
-            });
+            };
+
+            if !rewriter.finalize {
+                rewriter.block_queue.enqueue_block(new_block);
+                rewriter.finalize = true;
+            } else {
+                rewriter.block_queue.finalize(new_block);
+            }
         }
 
         let blocks = rewriter
@@ -250,22 +258,24 @@ impl<'db> FunctionInlinerRewriter<'db> {
     /// self.statements_rewrite_stack.
     fn rewrite(&mut self, statement: Statement) -> Maybe<()> {
         if let Statement::Call(ref stmt) = statement {
-            if let Some(called_func) = stmt.function.body(self.variables.db)? {
-                if let crate::ids::ConcreteFunctionWithBodyLongId::Specialized(specialized) =
-                    self.calling_function_id.lookup_intern(self.variables.db)
-                {
-                    if specialized.base == called_func {
-                        // A specialized function should always inline its base.
+            if !stmt.with_coupon {
+                if let Some(called_func) = stmt.function.body(self.variables.db)? {
+                    if let crate::ids::ConcreteFunctionWithBodyLongId::Specialized(specialized) =
+                        self.calling_function_id.lookup_intern(self.variables.db)
+                    {
+                        if specialized.base == called_func {
+                            // A specialized function should always inline its base.
+                            return self.inline_function(called_func, stmt);
+                        }
+                    }
+
+                    // TODO: Implement better logic to avoid inlining of destructors that call
+                    // themselves.
+                    if called_func != self.calling_function_id
+                        && self.variables.db.priv_should_inline(called_func)?
+                    {
                         return self.inline_function(called_func, stmt);
                     }
-                }
-
-                // TODO: Implement better logic to avoid inlining of destructors that call
-                // themselves.
-                if called_func != self.calling_function_id
-                    && self.variables.db.priv_should_inline(called_func)?
-                {
-                    return self.inline_function(called_func, stmt);
                 }
             }
         }
@@ -283,52 +293,47 @@ impl<'db> FunctionInlinerRewriter<'db> {
         let lowered = self.variables.db.lowered_body(function_id, LoweringStage::PostBaseline)?;
         lowered.blocks.has_root()?;
 
-        // Create a new block with all the statements that follow the call statement.
-        let return_block_id = self.block_queue.enqueue_block(
-            Block {
-                statements: std::mem::take(&mut self.unprocessed_statements).collect(),
-                end: self.block_end.clone(),
-            },
-            true,
-        );
-
         // As the block_ids and variable_ids are per function, we need to rename all
         // the blocks and variables before we enqueue the blocks from the function that
         // we are inlining.
 
         // The input variables need to be renamed to match the inputs to the function call.
-        let renamed_vars = HashMap::<VariableId, VariableId>::from_iter(izip!(
+        let renamed_vars = HashMap::<VariableId, VariableId>::from_iter(zip_eq(
             lowered.parameters.iter().cloned(),
-            call_stmt.inputs.iter().map(|var_usage| var_usage.var_id)
+            call_stmt.inputs.iter().map(|var_usage| var_usage.var_id),
         ));
 
         let db = self.variables.db;
         let inlining_location = call_stmt.location.lookup_intern(db).stable_location;
 
+        // The block_id_offset is the id of the first block in the new function, there is a `+1`
+        // because of the `new_block` bellow.
+        let block_id_offset =
+            self.block_queue.blocks.len() + self.block_queue.block_queue.len() + 1;
+        let new_block = Block {
+            statements: std::mem::take(&mut self.statements),
+            end: BlockEnd::Goto(BlockId(block_id_offset), VarRemapping::default()),
+        };
+        if self.finalize {
+            self.block_queue.finalize(new_block);
+            self.finalize = false;
+        } else {
+            self.block_queue.enqueue_block(new_block);
+        }
+
         let mut mapper = Mapper {
             variables: &mut self.variables,
             lowered: &lowered,
             renamed_vars,
-            block_id_offset: BlockId(return_block_id.0 + 1),
-            return_block_id,
+            block_id_offset: BlockId(block_id_offset),
+            return_block_id: BlockId(block_id_offset + lowered.blocks.len()),
             outputs: &call_stmt.outputs,
             inlining_location,
         };
 
-        // The current block should Goto to the root block of the inlined function.
-        // Note that we can't remap the inputs as they might be used after we return
-        // from the inlined function.
-        // TODO(ilya): Try to use var remapping instead of renaming for the inputs to
-        // keep track of the correct Variable.location.
-        self.block_end =
-            BlockEnd::Goto(mapper.map_block_id(BlockId::root()), VarRemapping::default());
-
-        for (block_id, block) in lowered.blocks.iter() {
+        for (_, block) in lowered.blocks.iter() {
             let block = mapper.rebuild_block(block);
-            // Inlining is top down - so need to perform further inlining on the inlined function
-            // blocks.
-            let new_block_id = self.block_queue.enqueue_block(block, false);
-            assert_eq!(mapper.map_block_id(block_id), new_block_id, "Unexpected block_id.");
+            self.block_queue.enqueue_block(block);
         }
 
         Ok(())

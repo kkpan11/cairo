@@ -83,6 +83,7 @@ pub enum FileLongId {
 pub enum FileKind {
     Module,
     Expr,
+    StatementList,
 }
 
 /// A mapping for a code rewrite.
@@ -145,6 +146,10 @@ pub struct VirtualFile {
     pub content: Arc<str>,
     pub code_mappings: Arc<[CodeMapping]>,
     pub kind: FileKind,
+    /// Whether an original item was removed when this virtual file was created
+    /// Relevant only for virtual files created during macros expansion.
+    /// This field is used by `cairo-language-server` for optimization purposes.
+    pub original_item_removed: bool,
 }
 impl VirtualFile {
     fn full_path(&self, db: &dyn FilesGroup) -> String {
