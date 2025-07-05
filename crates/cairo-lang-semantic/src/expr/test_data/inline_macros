@@ -611,11 +611,6 @@ error: Plugin diagnostic: Unused argument.
     format!("{2}{0}", ba, 2, 1);
                           ^
 
-error: Plugin diagnostic: Macro can not be parsed as legacy macro. Expected an argument list wrapped in either parentheses, brackets, or braces.
- --> lib.cairo:32:5
-    format!;
-    ^^^^^^^
-
 warning[E0001]: Unused variable. Consider ignoring by prefixing with `_`.
  --> lib.cairo:2:9
     let ba: ByteArray = "hello";
@@ -719,11 +714,6 @@ error: Plugin diagnostic: Unused argument.
     print!("{2}{0}", ba, 2, 1);
                          ^
 
-error: Plugin diagnostic: Macro can not be parsed as legacy macro. Expected an argument list wrapped in either parentheses, brackets, or braces.
- --> lib.cairo:32:5
-    print!;
-    ^^^^^^
-
 warning[E0001]: Unused variable. Consider ignoring by prefixing with `_`.
  --> lib.cairo:2:9
     let ba: ByteArray = "hello";
@@ -826,11 +816,6 @@ error: Plugin diagnostic: Unused argument.
  --> lib.cairo:29:28
     println!("{2}{0}", ba, 2, 1);
                            ^
-
-error: Plugin diagnostic: Macro can not be parsed as legacy macro. Expected an argument list wrapped in either parentheses, brackets, or braces.
- --> lib.cairo:32:5
-    println!;
-    ^^^^^^^^
 
 warning[E0001]: Unused variable. Consider ignoring by prefixing with `_`.
  --> lib.cairo:2:9
@@ -1074,7 +1059,7 @@ macro a_macro {
 
 //! > expected_diagnostics
 error: Empty path after `$defsite` is not allowed.
- --> lib.cairo[a_macro]:2:10
+ --> lib.cairo[a_macro]:1:10
         $defsite
          ^^^^^^^
 
@@ -1162,12 +1147,12 @@ fn consume_z(_z: felt252) {}
 
 //! > expected_diagnostics
 warning: Path in a macro without a resolver modifier ($callsite or $defsite) - currently resolving as $callsite but this will not be supported in future versions.
- --> lib.cairo[bas_use_z_from_callsite]:2:9
+ --> lib.cairo[bas_use_z_from_callsite]:1:9
         z
         ^
 
 error[E0006]: Identifier not found.
- --> lib.cairo[bas_use_z_from_callsite]:2:9
+ --> lib.cairo[bas_use_z_from_callsite]:1:9
         z
         ^
 
@@ -1206,7 +1191,7 @@ macro wrap_bas_use_z_from_callsite {
 
 //! > expected_diagnostics
 error[E0006]: Identifier not found.
- --> lib.cairo[wrap_bas_use_z_from_callsite][bas_use_z_from_callsite]:2:20
+ --> lib.cairo[wrap_bas_use_z_from_callsite][bas_use_z_from_callsite]:1:20
         $callsite::z
                    ^
 
@@ -1236,7 +1221,7 @@ fn bar() {}
 
 //! > expected_diagnostics
 warning: Path in a macro without a resolver modifier ($callsite or $defsite) - currently resolving as $callsite but this will not be supported in future versions.
- --> lib.cairo[call_bar]:2:9
+ --> lib.cairo[call_bar]:1:9
         bar()
         ^^^
 
@@ -1372,7 +1357,7 @@ macro test_macro {
 
 //! > expected_diagnostics
 error: Parser error in macro-expanded code: Missing tokens. Expected an expression.
- --> lib.cairo[test_macro]:2:12
+ --> lib.cairo[test_macro]:1:12
         1 +
            ^
 
@@ -1420,3 +1405,91 @@ error: No matching rule found in inline macro `test_macro`.
  --> lib.cairo:7:5
     test_macro!();
     ^^^^^^^^^^^^^
+
+//! > ==========================================================================
+
+//! > Test: Using a statement-list macro in statement position should work.
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: false)
+
+//! > function
+fn foo() {
+    statement_list_returning_macro!();
+}
+
+//! > function_name
+foo
+
+//! > module_code
+macro statement_list_returning_macro {
+    () => {
+        let _a = 1;
+    };
+}
+
+//! > expected_diagnostics
+
+//! > ==========================================================================
+
+//! > Test: Using a statement-list macro in expression position should fail.
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: true)
+
+//! > function
+fn foo() {
+    let _x = statement_list_returning_macro!();
+}
+
+//! > function_name
+foo
+
+//! > module_code
+macro statement_list_returning_macro {
+    () => {
+        let a = 1;
+        let b = 2;
+    };
+}
+
+//! > expected_diagnostics
+error: Parser error in macro-expanded code: Missing tokens. Expected an expression.
+ --> lib.cairo[statement_list_returning_macro]:1:1
+        let a = 1;
+^
+
+error: Parser error in macro-expanded code: Skipped tokens. Expected: end of expr.
+ --> lib.cairo[statement_list_returning_macro]:1:1-2:18
+          let a = 1;
+ _^
+|         let b = 2;
+|__________________^
+
+//! > ==========================================================================
+
+//! > Test: Macro in tail position with no tail expression should report MissingSemicolon.
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: true)
+
+//! > function
+fn foo() {
+    only_statements!()
+}
+
+//! > function_name
+foo
+
+//! > module_code
+macro only_statements {
+    () => {
+        let _a = 1;
+    };
+}
+
+//! > expected_diagnostics
+error: Missing semicolon
+ --> lib.cairo:7:23
+    only_statements!()
+                      ^

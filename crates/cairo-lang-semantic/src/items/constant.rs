@@ -14,6 +14,7 @@ use cairo_lang_syntax::node::ast::ItemConstant;
 use cairo_lang_syntax::node::ids::SyntaxStablePtrId;
 use cairo_lang_syntax::node::{TypedStablePtr, TypedSyntaxNode};
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
+use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
 use cairo_lang_utils::unordered_hash_set::UnorderedHashSet;
 use cairo_lang_utils::{
     Intern, LookupIntern, define_short_id, extract_matches, require, try_extract_matches,
@@ -558,9 +559,11 @@ impl ConstantEvaluateContext<'_> {
                 }
             }
             Expr::If(expr) => {
-                self.validate(match &expr.condition {
-                    Condition::BoolExpr(id) | Condition::Let(id, _) => *id,
-                });
+                for condition in &expr.conditions {
+                    self.validate(match condition {
+                        Condition::BoolExpr(id) | Condition::Let(id, _) => *id,
+                    });
+                }
                 self.validate(expr.if_block);
                 if let Some(else_block) = expr.else_block {
                     self.validate(else_block);
@@ -679,7 +682,7 @@ impl ConstantEvaluateContext<'_> {
                 )
             }
             Expr::EnumVariantCtor(expr) => {
-                ConstValue::Enum(expr.variant.clone(), Box::new(self.evaluate(expr.value_expr)))
+                ConstValue::Enum(expr.variant, Box::new(self.evaluate(expr.value_expr)))
             }
             Expr::MemberAccess(expr) => {
                 self.evaluate_member_access(expr).unwrap_or_else(ConstValue::Missing)
@@ -749,45 +752,58 @@ impl ConstantEvaluateContext<'_> {
                     ),
                 )
             }
-            Expr::If(expr) => match &expr.condition {
-                crate::Condition::BoolExpr(id) => {
-                    let condition = self.evaluate(*id);
-                    let ConstValue::Enum(variant, _) = condition else {
-                        return ConstValue::Missing(skip_diagnostic());
-                    };
-                    if variant == true_variant(self.db) {
-                        self.evaluate(expr.if_block)
-                    } else if let Some(else_block) = expr.else_block {
-                        self.evaluate(else_block)
-                    } else {
-                        self.unit_const.clone()
+            Expr::If(expr) => {
+                let mut if_condition: bool = true;
+                for condition in &expr.conditions {
+                    match condition {
+                        crate::Condition::BoolExpr(id) => {
+                            let condition = self.evaluate(*id);
+                            let ConstValue::Enum(variant, _) = condition else {
+                                return ConstValue::Missing(skip_diagnostic());
+                            };
+                            if variant != true_variant(self.db) {
+                                if_condition = false;
+                                break;
+                            }
+                        }
+                        crate::Condition::Let(id, patterns) => {
+                            let value = self.evaluate(*id);
+                            let ConstValue::Enum(variant, value) = value else {
+                                return ConstValue::Missing(skip_diagnostic());
+                            };
+                            let mut found_pattern = false;
+                            for pattern_id in patterns {
+                                let Pattern::EnumVariant(pattern) =
+                                    &self.arenas.patterns[*pattern_id]
+                                else {
+                                    continue;
+                                };
+                                if pattern.variant != variant {
+                                    // Continue to the next option in the `|` list.
+                                    continue;
+                                }
+                                if let Some(inner_pattern) = pattern.inner_pattern {
+                                    self.destructure_pattern(inner_pattern, *value);
+                                }
+                                found_pattern = true;
+                                break;
+                            }
+                            if !found_pattern {
+                                if_condition = false;
+                                break;
+                            }
+                        }
                     }
                 }
-                crate::Condition::Let(id, patterns) => {
-                    let value = self.evaluate(*id);
-                    let ConstValue::Enum(variant, value) = value else {
-                        return ConstValue::Missing(skip_diagnostic());
-                    };
-                    for pattern_id in patterns {
-                        let Pattern::EnumVariant(pattern) = &self.arenas.patterns[*pattern_id]
-                        else {
-                            continue;
-                        };
-                        if pattern.variant != variant {
-                            continue;
-                        }
-                        if let Some(inner_pattern) = pattern.inner_pattern {
-                            self.destructure_pattern(inner_pattern, *value);
-                        }
-                        return self.evaluate(expr.if_block);
-                    }
-                    if let Some(else_block) = expr.else_block {
-                        self.evaluate(else_block)
-                    } else {
-                        self.unit_const.clone()
-                    }
+
+                if if_condition {
+                    self.evaluate(expr.if_block)
+                } else if let Some(else_block) = expr.else_block {
+                    self.evaluate(else_block)
+                } else {
+                    self.unit_const.clone()
                 }
-            },
+            }
             _ => ConstValue::Missing(skip_diagnostic()),
         }
     }
@@ -908,14 +924,16 @@ impl ConstantEvaluateContext<'_> {
             } else if self.unwrap_non_zero == extern_fn {
                 let [ConstValue::NonZero(value)] = args else { return None };
                 return Some(value.as_ref().clone());
-            } else if self.downcast_fns.contains(&extern_fn) {
+            } else if let Some(reversed) = self.downcast_fns.get(&extern_fn) {
                 let [ConstValue::Int(value, _)] = args else { return None };
                 let TypeLongId::Concrete(ConcreteTypeId::Enum(enm)) = expr_ty.lookup_intern(db)
                 else {
                     return None;
                 };
-                let (some, none) =
+                let (variant0, variant1) =
                     db.concrete_enum_variants(enm).ok()?.into_iter().collect_tuple()?;
+                let (some, none) =
+                    if *reversed { (variant1, variant0) } else { (variant0, variant1) };
                 let success_ty = some.ty;
                 return Some(match validate_literal(db, success_ty, value) {
                     Ok(()) => {
@@ -1191,8 +1209,9 @@ pub struct ConstCalcInfo {
     panic_with_felt252: FunctionId,
     /// The integer `upcast` style functions.
     pub upcast_fns: UnorderedHashSet<ExternFunctionId>,
-    /// The integer `downcast` style functions.
-    pub downcast_fns: UnorderedHashSet<ExternFunctionId>,
+    /// The integer `downcast` style functions, mapping to whether it returns a reversed Option
+    /// enum.
+    pub downcast_fns: UnorderedHashMap<ExternFunctionId, bool>,
     /// The `unwrap_non_zero` function.
     unwrap_non_zero: ExternFunctionId,
 
@@ -1254,18 +1273,23 @@ impl ConstCalcInfo {
                 contract_address_module.extern_function_id("contract_address_to_felt252"),
             ]),
             downcast_fns: FromIterator::from_iter([
-                bounded_int.extern_function_id("downcast"),
-                integer.extern_function_id("u8_try_from_felt252"),
-                integer.extern_function_id("u16_try_from_felt252"),
-                integer.extern_function_id("u32_try_from_felt252"),
-                integer.extern_function_id("u64_try_from_felt252"),
-                integer.extern_function_id("i8_try_from_felt252"),
-                integer.extern_function_id("i16_try_from_felt252"),
-                integer.extern_function_id("i32_try_from_felt252"),
-                integer.extern_function_id("i64_try_from_felt252"),
-                integer.extern_function_id("i128_try_from_felt252"),
-                class_hash_module.extern_function_id("class_hash_try_from_felt252"),
-                contract_address_module.extern_function_id("contract_address_try_from_felt252"),
+                (bounded_int.extern_function_id("downcast"), false),
+                (bounded_int.extern_function_id("bounded_int_trim_min"), true),
+                (bounded_int.extern_function_id("bounded_int_trim_max"), true),
+                (integer.extern_function_id("u8_try_from_felt252"), false),
+                (integer.extern_function_id("u16_try_from_felt252"), false),
+                (integer.extern_function_id("u32_try_from_felt252"), false),
+                (integer.extern_function_id("u64_try_from_felt252"), false),
+                (integer.extern_function_id("i8_try_from_felt252"), false),
+                (integer.extern_function_id("i16_try_from_felt252"), false),
+                (integer.extern_function_id("i32_try_from_felt252"), false),
+                (integer.extern_function_id("i64_try_from_felt252"), false),
+                (integer.extern_function_id("i128_try_from_felt252"), false),
+                (class_hash_module.extern_function_id("class_hash_try_from_felt252"), false),
+                (
+                    contract_address_module.extern_function_id("contract_address_try_from_felt252"),
+                    false,
+                ),
             ]),
             unwrap_non_zero: zeroable.extern_function_id("unwrap_non_zero"),
             core_info,
